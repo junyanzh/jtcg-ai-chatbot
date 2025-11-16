@@ -1,0 +1,262 @@
+# JTCG Shop CRM AI Agent（AI 工程測驗）
+
+本專案是一個模擬電商客服場景的 RAG（Retrieval-Augmented Generation）型 AI Agent，目標是協助 JTCG Shop 回答常見 FAQ、商品推薦、訂單查詢與真人客服轉接等情境，並在小規模資料與有限開發時間下，盡量兼顧「搜尋準確度」、「回覆品質」與「系統可維護性」。
+
+---
+
+## 專案概要
+
+- **執行環境**：Vertex AI Workbench（Notebook），後端使用 Google Cloud（BigQuery、Cloud Storage、Vertex AI Gemini）
+- **主要功能**
+  - FAQ / 商品知識庫檢索與回答（RAG）
+  - 商品向量搜尋與推薦（根據螢幕支架等關鍵字）
+  - 訂單查詢流程（依 user_id / order_id 查詢）
+  - 真人客服轉接（模擬 API）
+- **資料來源**
+  - FAQ 資料：`ai-eng-test-sample-knowledges.csv`
+  - 商品資料：`ai-eng-test-sample-products.csv`
+  - 對話樣本：`ai-eng-test-sample-conversations.json`
+  - 訂單資料：Notebook 內建 JSON（模擬小型 Orders DB）
+
+---
+
+## 架構與流程總覽
+
+整體流程可以概略分成五個層次：
+
+1. **資料載入與標準化**
+   - 從 Cloud Storage 讀取 FAQ / 商品 CSV。
+   - 標準化欄位名稱（例如 `id`, `title`, `question`, `answer`, `url`、`sku`, `name`, `description`, `product_url`, `image_url` 等）。
+   - 將整理後的 DataFrame 寫入 BigQuery 資料表 `knowledges` 與 `products`。
+
+2. **向量嵌入與索引**
+   - 在 BigQuery 中建立 Remote Model，端點採用 **Gemini Multilingual 向量模型**：
+     - `ENDPOINT = 'gemini-embedding-001'`
+   - 對 FAQ：
+     - 使用 `question/title + answer` 串接成一段文字做 embedding，寫入 `answer_embedding` 欄位。
+   - 對商品：
+     - 使用 `description`（若無則退回 `name`）做 embedding，寫入 `description_embedding` 欄位。
+   - 之後透過 BigQuery 的 `VECTOR_SEARCH` 函式進行語意相似度搜尋。
+
+3. **意圖判斷（Intent Detection）**
+   - 使用簡單規則將使用者問題分類為：
+     - `FAQ`：一般客服、政策說明
+     - `PRODUCT`：商品規格 / 推薦 / VESA / 支架 / 走線等
+     - `ORDER`：查詢訂單狀態
+     - `HANDOFF`：要求真人客服
+   - 規則以關鍵字與簡單字串匹配為主，避免過度複雜的意圖模型。
+
+4. **各 Intent Handler**
+   - **FAQ Handler**
+     - 呼叫 BigQuery 向量搜尋，取得 Top-K FAQ。
+     - 若最相近 FAQ 題目/內容與使用者問題主題高度吻合（搭配簡單關鍵字比對），則直接以該 FAQ Answer 回覆。
+     - 若信心不夠高，則組成多個 context block 交由 LLM 統整回答。
+   - **PRODUCT Handler**
+     - 透過商品向量搜尋列出最相近的幾個商品，回覆名稱、簡要描述與商品連結。
+   - **ORDER Handler**
+     - 根據文字中是否含有 `user_id`（如 `u_123456`）與 `order_id`（如 `JTCG-YYYYMM-xxxxx`）決定流程：
+       - 沒有任何 ID：要求先提供 `user_id`
+       - 只有 `user_id`：列出該使用者底下所有訂單摘要
+       - 有 `user_id + order_id`：回傳該訂單詳細狀態、物流資訊與連結
+       - 只有 `order_id`：基於資訊安全，拒絕提供詳細內容，要求補上 `user_id`
+   - **HANDOFF Handler**
+     - 嘗試從使用者訊息中抓出 Email。
+     - 若格式正確，呼叫模擬的 `handover_simple` 轉接函式，回覆「已為您轉接真人」或錯誤訊息。
+     - 若未偵測到 Email，先請使用者提供 Email。
+
+5. **LLM 回覆層（RAG Answer Layer）**
+   - 使用 Vertex AI 的 **Gemini 2.5 Pro** 作為生成人類可讀回覆的最後一層。
+   - 將「使用者問題」與「RAG 檢索到的 FAQ / 商品內容」包裝成一個完整的 Prompt，請模型在嚴格規則下作答：
+     - 只能依賴檢索到的內容說明政策，不得自行發明條款。
+     - 若明顯有對應 FAQ，就用該 FAQ 的內容整理成清楚的回答。
+     - 只有在資料完全無關或沒有有用線索時，才回覆「無法根據現有資料確認」並建議改由真人客服協助。
+
+---
+
+## GCP 環境與前置設定
+
+### 1. 基本專案與區域
+
+- **專案 ID**：`willy-poc`（範例）
+- **BigQuery 位置**：`US`（多區域）
+- **Vertex AI 區域**：`us-central1`
+- **Cloud Storage Bucket**：`willy-poc-crm-agent`
+
+> 實作時需依照實際環境調整專案、Dataset 名稱與 Bucket 名稱。
+
+### 2. BigQuery Dataset 與資料表
+
+- Dataset：`jtcg`
+- 主要資料表：
+  - `jtcg.knowledges`
+    - FAQ 主鍵 `id`
+    - `title`, `question`, `answer`, `url`, `lang`
+    - 向量欄位：`answer_embedding`
+  - `jtcg.products`
+    - 商品主鍵 `sku`
+    - `name`, `description`, `spec`, `product_url`, `image_url`
+    - 向量欄位：`description_embedding`
+
+### 3. Remote Model 與 Connection
+
+- 建立 BigQuery Connection（例如）：`us.jtcg`
+- 透過 Remote Model 指向 Vertex AI 向量模型：
+  - `ENDPOINT = 'gemini-embedding-001'`
+- 供 `ML.GENERATE_EMBEDDING` 與 `VECTOR_SEARCH` 使用。
+
+### 4. API 與權限需求（概略）
+
+- 啟用 API（依實際環境調整）：
+  - BigQuery API
+  - BigQuery Connection API
+  - Vertex AI API
+  - Cloud Storage API
+- Service Account 需具備：
+  - 存取 BigQuery Dataset 的讀寫權限
+  - 存取 Cloud Storage Bucket 的讀取權限
+  - 使用 BigQuery Connection 呼叫 Vertex AI Remote Model 的權限
+
+---
+
+## 專案檔案與資料說明（對應 Github Repo）
+
+在 Github 專案中，主要會包含：
+
+- `README.md`（本文件）
+- Notebook 檔（例如）：`jtcg_crm_ai_agent.ipynb`
+  - 包含所有程式碼：資料載入、向量建模、Agent Handler、批次模擬對話與輸出。
+- （選用）`data/` 或 `config/` 資料夾：
+  - 標註 GCS 路徑與檔名（實際資料仍放在 GCS，而非 repo）。
+
+資料來源（實際檔案放在 GCS）：
+
+- FAQ CSV：`gs://willy-poc-crm-agent/ai-eng-test-sample-knowledges.csv`
+- 商品 CSV：`gs://willy-poc-crm-agent/ai-eng-test-sample-products.csv`
+- 對話 JSON：`gs://willy-poc-crm-agent/ai-eng-test-sample-conversations.json`
+
+---
+
+## 解決的問題與優化說明
+
+此專案在開發過程中，重點解決了以下幾類問題：
+
+### 1. FAQ 搜尋不準（向量模型與內容設計）
+
+**問題現象**
+
+- 早期使用 `text-embedding-004` 並僅對 `answer` 做 embedding。
+- 中文問句（例如「保固多久？維修怎麼申請？」）檢索到的 FAQ 不穩定，常落在優惠券或其他不相關主題。
+
+**解法**
+
+1. **改用多語言向量模型**
+   - 將 Remote Model 改為 `gemini-embedding-001`，更適合處理繁體中文語意。
+2. **改變 FAQ Embedding 內容**
+   - 將 `question/title` 與 `answer` 串成一段文字再做 embedding，使模型能同時學到「問題敘述」與「回答內容」，提升問句與 FAQ 之間的語意對齊能力。
+
+### 2. 檢索結果與問題主題偏移（關鍵字輔助比對）
+
+**問題現象**
+
+- 即使向量搜尋回來的 Top-1 看似合理，但在某些邊界情況，主題仍有偏移（例如保固 vs 優惠券）。
+- 單純依距離排序有時不足以判斷「是否為同一主題」。
+
+**解法**
+
+- 在 FAQ Handler 中加入簡單的 **主題關鍵字比對**：
+  - 對常見主題（如「保固」、「維修」、「發票」、「三聯」、「統編」、「出貨」、「免運」等）做雙向檢查：
+    - 該關鍵字同時出現在「使用者問題」與「候選 FAQ 的 title/answer」中，才視為高匹配。
+- 綜合考量：
+  - 若距離在合理範圍內，且關鍵字有對齊 → 直接採用該 FAQ Answer 回覆。
+  - 若沒有明顯主題對齊 → 交由 LLM 在多筆候選中統整與過濾。
+
+### 3. LLM 回覆過於保守或易說「資料不足」
+
+**問題現象**
+
+- 即便已檢索到明確 FAQ（例如保固 1 年、三聯式發票填寫方式），LLM 仍有機會回答「目前無法確認」，導致實際體驗不佳。
+
+**解法**
+
+- 調整 LLM Prompt 設計，明確規定：
+  - 只要檢索結果中已有「清楚、具體」的答案，就要直接用該資料做出自信且具體的回答。
+  - 僅在 **所有資料都無關或沒有有用線索** 時，才可回覆「無法確認」並建議改由真人客服。
+- 同時限制：
+  - 不得擅自新增任何退換貨、保固、發票、出貨、運費、優惠券的規則，必須以檢索到的內容為準。
+
+### 4. 降低幻覺與不必要的自由發揮
+
+- Prompt 中多次強調：
+  - 「只能依賴檢索到的內容回答政策與條款」
+  - 「不可自行臆測或發明規則」
+  - 「不要重複列出原始資料，也不要解釋思考過程」
+- 在實測中，這樣的約束讓回答風格更接近「FAQ 聚合整理」而非「聊天型模型隨意發揮」。
+
+---
+
+## 在 Vertex AI Workbench 上的執行方式（流程概述）
+
+1. **開啟 Notebook**
+   - 在 Vertex AI Workbench 中建立或開啟 Notebook Instance。
+   - 匯入專案中的 Notebook（例如 `jtcg_crm_ai_agent.ipynb`）。
+
+2. **設定環境參數**
+   - 設定 `PROJECT_ID`、`BQ_LOCATION`、`DATASET`、`BUCKET` 等變數。
+   - 確認本機或 Notebook service account 具有 BigQuery / GCS / Vertex AI 的必要權限。
+
+3. **依序執行 Notebook Cells**
+   - 資料載入與標準化，寫入 BigQuery。
+   - 建立 BigQuery Remote Model（`gemini-embedding-001`）。
+   - 產生 FAQ / 商品向量並更新資料表。
+   - 定義向量搜尋、意圖判斷、各 Handler 與 LLM 回覆層。
+   - 執行單點測試，確認：
+     - FAQ 題目如「保固多久？維修怎麼申請？」可以正確命中保固相關 FAQ。
+     - 發票 / 出貨 / 商品 / 訂單查詢 / 真人客服等測試案例皆正常。
+
+---
+
+## 批次模擬對話與人工檢視標記
+
+為了提交作業並評估 Agent 表現，Notebook 中實作了一個簡單的批次模擬流程：
+
+1. **讀取對話樣本**
+   - 從 GCS 讀取 `ai-eng-test-sample-conversations.json`。
+   - 每組對話取出最後一則使用者訊息作為測試 query。
+
+2. **執行 Agent 回覆**
+   - 對每個 query：
+     - 先做意圖判斷（FAQ / PRODUCT / ORDER / HANDOFF）。
+     - 呼叫 `answer_with_rag` 取得最終回覆。
+     - 同時抓取回覆中的 URL 連結（若有）。
+
+3. **彙整並輸出結果**
+   - 將結果整理成一個表格（DataFrame），欄位包含：
+     - `idx`：對話編號
+     - `user_query`：最後一則使用者訊息
+     - `detected_intent`：偵測到的意圖
+     - `agent_response`：Agent 回覆內容
+     - `source_links`：回覆中出現的連結
+     - `is_in_scope_and_correct`：保留空欄位給人工標註
+   - 儲存為 CSV 檔到 Notebook 使用者家目錄，例如：
+     - `~/jtcg_outputs/jtcg_agent_runs.csv`
+
+4. **人工檢視與標註**
+   - 將 CSV 匯出或下載，在試算表中檢查每一筆回覆：
+     - 判斷是否「在題目範圍內」且「答案正確」。
+     - 對於錯誤或邊界案例做標註，作為後續調整向量模型、關鍵字規則或 Prompt 的依據。
+
+---
+
+## 未來可擴充方向
+
+雖然本專案主要是針對測驗題目與小型 PoC，但仍保留了未來擴充的空間：
+
+- 將規則式 Intent Detection 替換或結合輕量級分類模型。
+- 增加更多 FAQ 類別與多語系內容（例如英文 / 日文 FAQ），善用多語言向量模型優勢。
+- 為產品搜尋加入更多結構化條件（如螢幕尺寸、重量、安裝方式）做混合檢索（向量 + 結構化 Filter）。
+- 串接實際後端服務（訂單系統、客服工單系統），取代目前的 JSON / mock API。
+- 將目前 Notebook 流程封裝成 Cloud Run / Functions API，方便前端與其他系統整合。
+
+---
+
+若需對 README 內容或架構描述再做微調（例如對應實際 Github repo 名稱、Notebook 檔名、或補充架構圖說明），可以在此基礎上延伸補充。
